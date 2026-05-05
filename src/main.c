@@ -9,6 +9,9 @@
 #include <unistd.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <dirent.h>
+
+#define MAX_ITERATIONS 5
 
 void run_onboarding(char* prompt_buf, char* run_id) {
     if (strlen(prompt_buf) == 0) {
@@ -132,31 +135,83 @@ int main(int argc, char** argv) {
     
     int iteration = 0;
     
-    // Highly optimized Dev/Auditor pipeline
-    while(!consensus) {
-        ui_log(C_KING, "Kernel", "Delegating task to Lead Developer (Iteration %d)", iteration);
+    while(!consensus && iteration < MAX_ITERATIONS) {
+        ui_log(C_KING, "Kernel", "Delegating to Dev (iteration %d/%d)", iteration + 1, MAX_ITERATIONS);
         char* dev_msg = run_agent_loop(
             "Dev", C_DEV, run_id, 
-            "You are Dev, a fast autonomous C programmer. You use tools via strict XML tags. You have FULL file memory injected into your prompt, do not 'cat' them. Use <patch file=\"f\"> to quickly change specific lines. Use <write file=\"f\"> for new files. Use <bash> to compile. DO NOT execute games or infinite loops. ONLY output <message> once code compiles and works.",
+            "You are a C developer. Write all source files and a Makefile for the project.\n"
+            "Output format — use this EXACTLY:\n\n"
+            "FILE:main.c\n"
+            "#include <stdio.h>\n"
+            "int main() { printf(\"hello\"); return 0; }\n"
+            "ENDFILE\n\n"
+            "FILE:Makefile\n"
+            "all: main\n"
+            "\tgcc -o main main.c\n"
+            "ENDFILE\n\n"
+            "DONE\n\n"
+            "Output ALL files now. No explanation. No markdown.",
             dev_task
         );
         
-        ui_log(C_KING, "Kernel", "Forwarding codebase to Auditor.");
+        // Auto-compile and let Auditor verify
+        ui_log(C_KING, "Kernel", "Running Auditor verification...");
         
-        char* hater_task = malloc(strlen(dev_msg) + 8192);
-        sprintf(hater_task, "Dev claims completion: %s. Use <bash> to compile and run tests on the codebase (DO NOT run infinite games). Read the workspace memory above. If absolutely perfect, output strictly <message>APPROVE: reason</message>. If there are flaws or missing features, output <message>REJECT: specific feedback</message>.", dev_msg);
+        // Get workspace state and compile
+        char compile_cmd[512];
+        snprintf(compile_cmd, sizeof(compile_cmd), "playground/%s/run_cmd.sh", run_id);
         
-        char* hater_msg = run_agent_loop(
-            "Auditor", C_HATER, run_id,
-            "You are Auditor, a highly critical and impatient QA reviewer. You have the codebase loaded in memory. Find bugs quickly and use <bash> to prove them. Output <message> instantly when decided.",
-            hater_task
-        );
+        // Run make to get compile output for auditor
+        char* ws_summary = NULL;
+        {
+            // Read workspace files for auditor context
+            char dir_path[256];
+            snprintf(dir_path, sizeof(dir_path), "playground/%s", run_id);
+            // Simple file listing
+            char listing[2048] = "";
+            DIR *d = opendir(dir_path);
+            if (d) {
+                struct dirent *ent;
+                int off = 0;
+                while ((ent = readdir(d)) != NULL) {
+                    if (ent->d_type == DT_REG && strcmp(ent->d_name, "run_cmd.sh") != 0) {
+                        off += snprintf(listing + off, sizeof(listing) - off, "  %s\n", ent->d_name);
+                    }
+                }
+                closedir(d);
+            }
+            ws_summary = strdup(listing);
+        }
         
-        if (strstr(hater_msg, "REJECT")) {
-            ui_log(C_KING, "Kernel", "Auditor rejected PR. Escalating back to Dev.");
+        // Compile
+        start_spinner("[System] Compiling...");
+        char make_cmd[512];
+        snprintf(make_cmd, sizeof(make_cmd), "cd playground/%s && make 2>&1", run_id);
+        FILE* fp = popen(make_cmd, "r");
+        char compile_out[2048] = "";
+        if (fp) {
+            char line[256];
+            int off = 0;
+            while (fgets(line, sizeof(line), fp) && off < 1800) {
+                int n = snprintf(compile_out + off, sizeof(compile_out) - off, "%s", line);
+                if (n > 0) off += n;
+            }
+            pclose(fp);
+        }
+        stop_spinner();
+        if (strlen(compile_out) == 0) strcpy(compile_out, "(no output from make)");
+        ui_log_raw(C_SYS, "-> Compile: %s", compile_out);
+        
+        // Auditor: single LLM call
+        char* auditor_msg = run_auditor(run_id, compile_out, ws_summary);
+        free(ws_summary);
+        
+        if (strstr(auditor_msg, "REJECT")) {
+            ui_log(C_KING, "Kernel", "Rejected. Sending feedback to Dev.");
             free(dev_task);
-            dev_task = malloc(strlen(hater_msg) + strlen(prompt_buf) + 1024);
-            sprintf(dev_task, "Original Goal: %s\n\nYour previous work was REJECTED. Auditor Feedback:\n%s\nFix the issues using <patch> or <write>.", prompt_buf, hater_msg);
+            dev_task = malloc(strlen(auditor_msg) + strlen(prompt_buf) + strlen(compile_out) + 512);
+            sprintf(dev_task, "Goal: %s\nREJECTED. Compile errors:\n%s\nAuditor says: %s\nFix and output corrected files.", 
+                prompt_buf, compile_out, auditor_msg);
             iteration++;
         } else {
             ui_log(C_KING, "Kernel", "Consensus reached. Build verified.");
@@ -164,8 +219,11 @@ int main(int argc, char** argv) {
         }
         
         free(dev_msg);
-        free(hater_task);
-        free(hater_msg);
+        free(auditor_msg);
+    }
+    
+    if (!consensus) {
+        ui_log(C_KING, "Kernel", "Max iterations reached (%d). Proceeding with best effort.", MAX_ITERATIONS);
     }
     free(dev_task);
     
@@ -182,13 +240,7 @@ int main(int argc, char** argv) {
         if (strlen(input) == 0) continue;
         
         ui_log(C_YOU, "User", "%s", input);
-        
-        char* repl_msg = run_agent_loop(
-            "Dev", C_DEV, run_id, 
-            "You are Dev, an assistant in an infinite REPL shell. The workspace is fully cached. Use <patch> and <write> to modify the code. ONLY output <message> when done.",
-            input
-        );
-        free(repl_msg);
+        run_repl(run_id, input);
     }
     
     ui_log(C_KING, "Kernel", "Process terminated. Workspace intact at ./playground/%s", run_id);

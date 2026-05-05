@@ -1,0 +1,8 @@
+.env
+output/
+*.o
+silicon_court
+state.bin
+google_credentials.json
+playground/
+.vscode/
